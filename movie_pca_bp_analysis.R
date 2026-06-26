@@ -10,13 +10,47 @@
 # -------------------------
 # 如本机尚未安装，请先运行：
 # install.packages(c("tidyverse", "neuralnet", "corrplot"))
+
 library(tidyverse)
 library(neuralnet)
 library(corrplot)
 
 set.seed(20260626)
 
-PROJECT_DIR <- getwd()
+detect_project_dir <- function() {
+  env_dir <- Sys.getenv("MOVIE_PCA_BP_PROJECT_DIR", unset = NA_character_)
+  if (!is.na(env_dir) && dir.exists(env_dir)) {
+    return(normalizePath(env_dir, winslash = "/", mustWork = TRUE))
+  }
+
+  command_file <- commandArgs(trailingOnly = FALSE)
+  command_file <- command_file[startsWith(command_file, "--file=")]
+  if (length(command_file) > 0) {
+    script_path <- sub("^--file=", "", command_file[[1]])
+    return(dirname(normalizePath(script_path, winslash = "/", mustWork = TRUE)))
+  }
+
+  frame_files <- vapply(sys.frames(), function(frame) {
+    file <- frame$ofile
+    if (is.null(file)) NA_character_ else file
+  }, character(1))
+  frame_files <- frame_files[!is.na(frame_files)]
+  if (length(frame_files) > 0) {
+    script_path <- frame_files[[length(frame_files)]]
+    return(dirname(normalizePath(script_path, winslash = "/", mustWork = TRUE)))
+  }
+
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    active_doc <- rstudioapi::getActiveDocumentContext()$path
+    if (!is.null(active_doc) && nzchar(active_doc)) {
+      return(dirname(normalizePath(active_doc, winslash = "/", mustWork = TRUE)))
+    }
+  }
+
+  normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+
+PROJECT_DIR <- detect_project_dir()
 OUTPUT_DIR <- file.path(PROJECT_DIR, "outputs_movie_pca_bp")
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
@@ -25,8 +59,12 @@ dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 # title-year fallback 仅用于本地数据缺桥接字段时的应急补齐，报告中应如实说明。
 ALLOW_TITLE_YEAR_IMDB_FALLBACK <- TRUE
 
-# PCA 主成分累计贡献率阈值。达到 85% 后停止取主成分。
+# 各业务组内 PCA 主成分累计贡献率阈值。达到 85% 后停止取主成分。
 PCA_CUMULATIVE_THRESHOLD <- 0.85
+
+# 业务分组约束：每个业务组至少保留 1 个主成分，避免影片年份/影片年龄等
+# 单一内容变量在整体 PCA 中压过流量运营指标。
+PCA_MAX_COMPONENTS_PER_BUSINESS_GROUP <- 3
 
 # 每个分组至少需要的样本数。样本太少时 BP 神经网络结果不稳定。
 MIN_GROUP_N <- 30
@@ -176,6 +214,20 @@ format_pc_expression <- function(loadings_df, pc_col, digits = 3) {
   )
 
   paste0(pc_col, " = ", str_remove(paste(terms, collapse = " "), "^\\+"))
+}
+
+select_pca_component_count <- function(cumulative_ratio, max_components) {
+  n_components <- which(cumulative_ratio >= PCA_CUMULATIVE_THRESHOLD)[1]
+
+  if (is.na(n_components)) {
+    n_components <- length(cumulative_ratio)
+  }
+
+  min(
+    max(n_components, 1),
+    max_components,
+    length(cumulative_ratio)
+  )
 }
 
 # -------------------------
@@ -674,23 +726,25 @@ if (nrow(movie_level_raw) < MIN_GROUP_N) {
 # 8. 原生字段与衍生指标说明表
 # -------------------------
 feature_dictionary <- tribble(
-  ~feature, ~source_type, ~definition,
-  "tmdb_popularity_native", "TMDB 原生字段", "TMDB 数据集自带 popularity，表示平台热度/流量关注度，不能写成衍生指标。",
-  "tmdb_budget", "TMDB 原生字段", "TMDB 数据集自带预算。",
-  "tmdb_revenue", "TMDB 原生字段", "TMDB 数据集自带票房/收入。",
-  "tmdb_runtime", "TMDB 原生字段", "TMDB 数据集自带片长。",
-  "tmdb_vote_count", "TMDB 原生字段", "TMDB 数据集自带评分人数，属于平台反馈规模指标。",
-  "release_year", "TMDB/MovieLens 原生日期提取", "由 TMDB release_date 或 MovieLens 标题年份提取。",
-  "ml_interaction_count", "MovieLens 衍生分析指标", "由 ratings 评分记录按 movieId 聚合得到的影片总互动量。",
-  "ml_user_count", "MovieLens 衍生分析指标", "由 ratings 评分记录按 movieId 聚合得到的去重评分用户数。",
-  "ml_user_activity_mean", "MovieLens 衍生分析指标", "先统计每个用户评分次数，再计算观看该片用户的平均活跃度。",
-  "ml_high_activity_user_share", "MovieLens 衍生分析指标", "观看该片用户中高活跃用户占比。",
-  "tmdb_popularity_log", "工程衍生指标", "对 TMDB 原生 popularity 做 log1p 变换，降低长尾偏态。",
-  "tmdb_budget_log", "工程衍生指标", "对 TMDB 原生预算做 log1p 变换。",
-  "tmdb_revenue_log", "工程衍生指标", "对 TMDB 原生票房/收入做 log1p 变换。",
-  "tmdb_profit_log", "工程衍生指标", "由 revenue - budget 得到利润后做带符号 log1p 变换。",
-  "tmdb_roi_clean", "工程衍生指标", "由 revenue / budget 得到投资回报率；预算缺失或为 0 时置为缺失后用中位数填补。",
-  "movie_age", "工程衍生指标", "由当前年份 - release_year 得到影片年龄。"
+  ~feature, ~business_group, ~source_type, ~definition,
+  "tmdb_popularity_native", "traffic_heat", "TMDB 原生字段", "TMDB 数据集自带 popularity，表示平台热度/流量关注度，不能写成衍生指标。",
+  "tmdb_budget", "commercial_operation", "TMDB 原生字段", "TMDB 数据集自带预算。",
+  "tmdb_revenue", "commercial_operation", "TMDB 原生字段", "TMDB 数据集自带票房/收入。",
+  "tmdb_runtime", "content_attribute", "TMDB 原生字段", "TMDB 数据集自带片长。",
+  "tmdb_vote_count", "traffic_heat", "TMDB 原生字段", "TMDB 数据集自带评分人数，属于平台反馈规模指标。",
+  "release_year", "content_attribute", "TMDB/MovieLens 原生日期提取", "由 TMDB release_date 或 MovieLens 标题年份提取。",
+  "ml_interaction_count", "traffic_heat", "MovieLens 衍生分析指标", "由 ratings 评分记录按 movieId 聚合得到的影片总互动量。",
+  "ml_user_count", "traffic_heat", "MovieLens 衍生分析指标", "由 ratings 评分记录按 movieId 聚合得到的去重评分用户数。",
+  "ml_user_activity_mean", "audience_preference", "MovieLens 衍生分析指标", "先统计每个用户评分次数，再计算观看该片用户的平均活跃度。",
+  "ml_high_activity_user_share", "audience_preference", "MovieLens 衍生分析指标", "观看该片用户中高活跃用户占比。",
+  "tmdb_popularity_log", "traffic_heat", "工程衍生指标", "对 TMDB 原生 popularity 做 log1p 变换，降低长尾偏态。",
+  "tmdb_budget_log", "commercial_operation", "工程衍生指标", "对 TMDB 原生预算做 log1p 变换。",
+  "tmdb_revenue_log", "commercial_operation", "工程衍生指标", "对 TMDB 原生票房/收入做 log1p 变换。",
+  "tmdb_profit_log", "commercial_operation", "工程衍生指标", "由 revenue - budget 得到利润后做带符号 log1p 变换。",
+  "tmdb_roi_clean", "commercial_operation", "工程衍生指标", "由 revenue / budget 得到投资回报率；预算缺失或为 0 时置为缺失后用中位数填补。",
+  "movie_age", "content_attribute", "工程衍生指标", "由当前年份 - release_year 得到影片年龄。",
+  "tmdb_genre_count", "content_attribute", "TMDB 原生字段加工", "由 TMDB genres 字段解析得到的电影类型数量。",
+  "ml_rating_sd", "audience_preference", "MovieLens 衍生分析指标", "由 MovieLens 评分记录按电影聚合得到的评分标准差，用于刻画评价分歧。"
 )
 
 readr::write_csv(feature_dictionary, file.path(OUTPUT_DIR, "feature_dictionary.csv"))
@@ -729,25 +783,40 @@ add_engineered_features <- function(df) {
 movie_level_engineered <- movie_level_raw %>%
   add_engineered_features()
 
-# PCA 与 BP 神经网络使用的解释变量。
-# 其中 tmdb_popularity_native 的建模版本为 tmdb_popularity_log；
-# 原字段仍在 feature_dictionary 中标注为 TMDB 原生流量指标。
-pca_feature_vars <- c(
-  "tmdb_popularity_log",
-  "tmdb_budget_log",
-  "tmdb_revenue_log",
-  "tmdb_profit_log",
-  "tmdb_roi_clean",
-  "tmdb_runtime",
-  "tmdb_vote_count_log",
-  "movie_age",
-  "tmdb_genre_count",
-  "ml_interaction_count_log",
-  "ml_user_count_log",
-  "ml_user_activity_mean_log",
-  "ml_high_activity_user_share",
-  "ml_rating_sd"
+# PCA 与 BP 神经网络使用的解释变量采用业务分组约束：
+# 先在“流量热度、商业运营、内容属性、受众偏好”四组内部单独 PCA，
+# 再将各组主成分拼接输入 BP 神经网络。
+business_feature_groups <- list(
+  traffic_heat = c(
+    "tmdb_popularity_log",
+    "tmdb_vote_count_log",
+    "ml_interaction_count_log",
+    "ml_user_count_log"
+  ),
+  commercial_operation = c(
+    "tmdb_budget_log",
+    "tmdb_revenue_log",
+    "tmdb_profit_log",
+    "tmdb_roi_clean"
+  ),
+  content_attribute = c(
+    "tmdb_runtime",
+    "tmdb_genre_count",
+    "movie_age"
+  ),
+  audience_preference = c(
+    "ml_user_activity_mean_log",
+    "ml_high_activity_user_share",
+    "ml_rating_sd"
+  )
 )
+
+pca_feature_vars <- unlist(business_feature_groups, use.names = FALSE)
+
+business_feature_map <- enframe(business_feature_groups, name = "business_group", value = "feature") %>%
+  unnest(feature)
+
+readr::write_csv(business_feature_map, file.path(OUTPUT_DIR, "business_feature_groups.csv"))
 
 target_var <- "ml_rating_mean"
 
@@ -850,37 +919,87 @@ run_group_analysis <- function(df, group_name) {
     return(NULL)
   }
 
-  scaled <- safe_scale_matrix(df, pca_feature_vars)
+  pca_items <- imap(business_feature_groups, function(vars, business_group) {
+    scaled <- safe_scale_matrix(df, vars)
+    pca_fit <- prcomp(scaled$x, center = FALSE, scale. = FALSE)
+    variance_ratio <- pca_fit$sdev^2 / sum(pca_fit$sdev^2)
+    cumulative_ratio <- cumsum(variance_ratio)
 
-  pca_fit <- prcomp(scaled$x, center = FALSE, scale. = FALSE)
-  variance_ratio <- pca_fit$sdev^2 / sum(pca_fit$sdev^2)
-  cumulative_ratio <- cumsum(variance_ratio)
-  n_components <- which(cumulative_ratio >= PCA_CUMULATIVE_THRESHOLD)[1]
+    n_components <- select_pca_component_count(
+      cumulative_ratio,
+      max_components = min(
+        PCA_MAX_COMPONENTS_PER_BUSINESS_GROUP,
+        ncol(scaled$x),
+        nrow(df) - 1
+      )
+    )
 
-  if (is.na(n_components)) {
-    n_components <- length(variance_ratio)
-  }
+    component_prefix <- case_when(
+      business_group == "traffic_heat" ~ "traffic",
+      business_group == "commercial_operation" ~ "commercial",
+      business_group == "content_attribute" ~ "content",
+      business_group == "audience_preference" ~ "audience",
+      TRUE ~ business_group
+    )
+    selected_components <- seq_len(n_components)
+    pc_cols <- paste0(component_prefix, "_PC", selected_components)
 
-  # 控制 BP 输入维度，避免小样本分组中过拟合。
-  n_components <- min(
-    max(n_components, 2),
-    8,
-    ncol(scaled$x),
-    nrow(df) - 1
-  )
+    variance_df <- tibble(
+      group = group_name,
+      business_group = business_group,
+      component = paste0(component_prefix, "_PC", seq_along(variance_ratio)),
+      local_component = paste0("PC", seq_along(variance_ratio)),
+      variance_ratio = variance_ratio,
+      cumulative_ratio = cumulative_ratio,
+      selected_for_bp = seq_along(variance_ratio) <= n_components
+    )
 
-  pc_cols <- paste0("PC", seq_len(n_components))
+    rotation_selected <- pca_fit$rotation[, selected_components, drop = FALSE]
+    colnames(rotation_selected) <- pc_cols
 
-  variance_df <- tibble(
-    group = group_name,
-    component = paste0("PC", seq_along(variance_ratio)),
-    variance_ratio = variance_ratio,
-    cumulative_ratio = cumulative_ratio,
-    selected_for_bp = seq_along(variance_ratio) <= n_components
-  )
+    loadings_df <- as.data.frame(rotation_selected) %>%
+      rownames_to_column("feature") %>%
+      pivot_longer(
+        cols = all_of(pc_cols),
+        names_to = "component",
+        values_to = "loading"
+      ) %>%
+      mutate(
+        group = group_name,
+        business_group = business_group,
+        local_component = str_replace(component, paste0("^", component_prefix, "_"), "")
+      ) %>%
+      select(group, business_group, component, local_component, feature, loading)
 
-  loadings_df <- as.data.frame(pca_fit$rotation[, seq_len(n_components), drop = FALSE]) %>%
-    rownames_to_column("feature")
+    expressions <- map_chr(selected_components, function(component_index) {
+      expr_df <- as.data.frame(rotation_selected[, component_index, drop = FALSE]) %>%
+        rownames_to_column("feature")
+      names(expr_df)[[2]] <- pc_cols[[component_index]]
+      format_pc_expression(expr_df, pc_cols[[component_index]])
+    })
+
+    pca_scores <- as_tibble(pca_fit$x[, selected_components, drop = FALSE])
+    names(pca_scores) <- pc_cols
+
+    list(
+      business_group = business_group,
+      vars = vars,
+      pca = pca_fit,
+      center = scaled$center,
+      scale = scaled$scale,
+      n_components = n_components,
+      pc_cols = pc_cols,
+      scores = pca_scores,
+      variance = variance_df,
+      loadings = loadings_df,
+      expressions = expressions
+    )
+  })
+
+  variance_df <- map_dfr(pca_items, "variance")
+  loadings_df <- map_dfr(pca_items, "loadings")
+  pc_cols <- unlist(map(pca_items, "pc_cols"), use.names = FALSE)
+  n_components <- length(pc_cols)
 
   readr::write_csv(
     variance_df,
@@ -891,17 +1010,25 @@ run_group_analysis <- function(df, group_name) {
     file.path(OUTPUT_DIR, paste0("pca_loadings_", group_name, ".csv"))
   )
 
-  scree_plot <- ggplot(variance_df, aes(x = seq_along(variance_ratio), y = variance_ratio)) +
-    geom_col(fill = "#2F6F73", width = 0.72) +
-    geom_line(aes(y = cumulative_ratio), color = "#C4492D", linewidth = 0.9) +
-    geom_point(aes(y = cumulative_ratio), color = "#C4492D", size = 2) +
-    scale_x_continuous(breaks = seq_along(variance_ratio)) +
-    labs(
-      title = paste0("Scree Plot - ", group_name),
-      x = "Principal Component",
-      y = "Variance / Cumulative Variance"
+  scree_plot <- ggplot(
+    variance_df,
+    aes(x = local_component, y = variance_ratio, fill = business_group)
+  ) +
+    geom_col(width = 0.72, alpha = 0.9) +
+    geom_line(
+      aes(y = cumulative_ratio, group = business_group),
+      color = "#C4492D",
+      linewidth = 0.8
     ) +
-    theme_minimal(base_size = 12)
+    geom_point(aes(y = cumulative_ratio), color = "#C4492D", size = 1.8) +
+    facet_wrap(~ business_group, scales = "free_x") +
+    labs(
+      title = paste0("Business-Constrained PCA Scree Plot - ", group_name),
+      x = "Principal Component in Business Group",
+      y = "Within-Group Variance / Cumulative Variance",
+      fill = "Business Group"
+    ) +
+    theme_minimal(base_size = 11)
 
   ggsave(
     filename = file.path(OUTPUT_DIR, paste0("scree_", group_name, ".png")),
@@ -911,10 +1038,8 @@ run_group_analysis <- function(df, group_name) {
     dpi = 150
   )
 
-  expressions <- map_chr(pc_cols, ~ format_pc_expression(loadings_df, .x))
-
-  pca_scores <- as_tibble(pca_fit$x[, seq_len(n_components), drop = FALSE])
-  names(pca_scores) <- pc_cols
+  expressions <- flatten_chr(map(pca_items, "expressions"))
+  pca_scores <- bind_cols(map(pca_items, "scores"))
 
   model_df <- bind_cols(
     pca_scores,
@@ -1000,9 +1125,7 @@ run_group_analysis <- function(df, group_name) {
 
   list(
     group = group_name,
-    pca = pca_fit,
-    feature_center = scaled$center,
-    feature_scale = scaled$scale,
+    business_pca = pca_items,
     n_components = n_components,
     pc_cols = pc_cols,
     variance = variance_df,
@@ -1027,13 +1150,22 @@ group_results <- imap(analysis_groups, run_group_analysis)
 group_results <- group_results[!map_lgl(group_results, is.null)]
 
 pca_variance_all <- map_dfr(group_results, "variance")
-pca_loadings_all <- imap_dfr(group_results, function(result, group_name) {
-  result$loadings %>% mutate(group = group_name, .before = 1)
-})
+pca_loadings_all <- map_dfr(group_results, "loadings")
+pca_business_summary <- pca_variance_all %>%
+  filter(selected_for_bp) %>%
+  group_by(group, business_group) %>%
+  summarise(
+    selected_pc_n = n(),
+    selected_variance_sum = sum(variance_ratio, na.rm = TRUE),
+    max_selected_cumulative_ratio = max(cumulative_ratio, na.rm = TRUE),
+    first_pc_variance_ratio = variance_ratio[local_component == "PC1"][[1]],
+    .groups = "drop"
+  )
 bp_mse_all <- map_dfr(group_results, "mse")
 
 readr::write_csv(pca_variance_all, file.path(OUTPUT_DIR, "pca_variance_all_groups.csv"))
 readr::write_csv(pca_loadings_all, file.path(OUTPUT_DIR, "pca_loadings_all_groups.csv"))
+readr::write_csv(pca_business_summary, file.path(OUTPUT_DIR, "pca_business_group_summary.csv"))
 readr::write_csv(bp_mse_all, file.path(OUTPUT_DIR, "bp_mse_comparison.csv"))
 
 pc_expression_lines <- imap(group_results, function(result, group_name) {
@@ -1083,13 +1215,17 @@ predict_with_result <- function(sample_df, result) {
     return(NA_real_)
   }
 
-  mat <- as.matrix(sample_df[, pca_feature_vars, drop = FALSE])
-  mat_scaled <- sweep(mat, 2, result$feature_center, "-")
-  mat_scaled <- sweep(mat_scaled, 2, result$feature_scale, "/")
+  pc_scores <- bind_cols(map(result$business_pca, function(item) {
+    mat <- as.matrix(sample_df[, item$vars, drop = FALSE])
+    mat_scaled <- sweep(mat, 2, item$center, "-")
+    mat_scaled <- sweep(mat_scaled, 2, item$scale, "/")
 
-  pc_scores <- mat_scaled %*% result$pca$rotation[, seq_len(result$n_components), drop = FALSE]
-  pc_scores <- as_tibble(pc_scores)
-  names(pc_scores) <- result$pc_cols
+    selected_components <- seq_len(item$n_components)
+    scores <- mat_scaled %*% item$pca$rotation[, selected_components, drop = FALSE]
+    scores <- as_tibble(scores)
+    names(scores) <- item$pc_cols
+    scores
+  }))
 
   pred_scaled <- as.numeric(neuralnet::compute(result$nn, pc_scores)$net.result)
   pred <- pred_scaled * result$y_range + result$y_min
@@ -1159,5 +1295,13 @@ run_summary <- tibble(
 
 readr::write_csv(run_summary, file.path(OUTPUT_DIR, "run_summary.csv"))
 
-message("分析完成。输出目录：", OUTPUT_DIR)
-message("重点查看：bp_mse_comparison.csv、pca_variance_all_groups.csv、pca_component_expressions.txt、new_sample_predictions.csv")
+message("分析完成。原始输出目录：", OUTPUT_DIR)
+
+chinese_export_script <- file.path(PROJECT_DIR, "export_chinese_outputs.R")
+if (file.exists(chinese_export_script)) {
+  source(chinese_export_script, local = TRUE)
+  message("重点查看中文输出：", file.path(PROJECT_DIR, "outputs_movie_pca_bp_cn"))
+} else {
+  warning("未找到 export_chinese_outputs.R，暂未生成中文输出目录。")
+}
+

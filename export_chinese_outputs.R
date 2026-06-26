@@ -6,15 +6,41 @@
 library(tidyverse)
 library(corrplot)
 
-input_dir <- "outputs_movie_pca_bp"
-output_dir <- "outputs_movie_pca_bp_cn"
+if (!exists("PROJECT_DIR", inherits = TRUE)) {
+  PROJECT_DIR <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+
+input_dir <- file.path(PROJECT_DIR, "outputs_movie_pca_bp")
+output_dir <- file.path(PROJECT_DIR, "outputs_movie_pca_bp_cn")
 dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 清理旧版编号输出，避免业务分组PCA改版后出现两套结果文件。
+stale_output_files <- c(
+  "06_BP神经网络MSE对比.csv",
+  "07_新样本预测结果.csv",
+  "08_指标来源说明.csv",
+  "09_MovieLens数据来源摘要.csv",
+  "10_PCA主成分表达式.txt",
+  "11_相关性热力图.png",
+  "12_全局样本PCA碎石图.png",
+  "13_1990年及以前PCA碎石图.png",
+  "14_1991-2009年PCA碎石图.png",
+  "15_2010年及以后PCA碎石图.png"
+)
+unlink(file.path(output_dir, stale_output_files), force = TRUE)
 
 group_map <- c(
   global = "全局样本",
   year_le_1990 = "1990年及以前",
   year_1991_2009 = "1991-2009年",
   year_ge_2010 = "2010年及以后"
+)
+
+business_group_map <- c(
+  traffic_heat = "流量热度",
+  commercial_operation = "商业运营",
+  content_attribute = "内容属性",
+  audience_preference = "受众偏好"
 )
 
 year_label_map <- c(
@@ -71,6 +97,7 @@ write_csv_out <- function(df, name) {
 }
 
 recode_group <- function(x) recode(x, !!!group_map, .default = x)
+recode_business_group <- function(x) recode(x, !!!business_group_map, .default = x)
 recode_feature <- function(x) recode(x, !!!feature_map, .default = x)
 
 # 1. 运行摘要
@@ -136,13 +163,16 @@ write_csv_out(strata, "03_双重分层样本分布.csv")
 pca_variance <- read_csv_in("pca_variance_all_groups.csv") %>%
   mutate(
     group = recode_group(group),
+    business_group = recode_business_group(business_group),
     variance_ratio = round(variance_ratio, 4),
     cumulative_ratio = round(cumulative_ratio, 4),
     selected_for_bp = if_else(selected_for_bp, "是", "否")
   ) %>%
   rename(
     "分组" = group,
+    "业务组别" = business_group,
     "主成分" = component,
+    "组内主成分" = local_component,
     "方差贡献率" = variance_ratio,
     "累计贡献率" = cumulative_ratio,
     "是否用于BP建模" = selected_for_bp
@@ -153,12 +183,39 @@ write_csv_out(pca_variance, "04_PCA方差贡献率.csv")
 pca_loadings <- read_csv_in("pca_loadings_all_groups.csv") %>%
   mutate(
     group = recode_group(group),
+    business_group = recode_business_group(business_group),
     feature = recode_feature(feature)
   ) %>%
-  rename("分组" = group, "变量" = feature)
+  rename(
+    "分组" = group,
+    "业务组别" = business_group,
+    "主成分" = component,
+    "组内主成分" = local_component,
+    "变量" = feature,
+    "载荷系数" = loading
+  )
 write_csv_out(pca_loadings, "05_PCA主成分载荷矩阵.csv")
 
-# 6. BP模型MSE
+# 6. PCA业务组主成分汇总
+pca_business_summary <- read_csv_in("pca_business_group_summary.csv") %>%
+  mutate(
+    group = recode_group(group),
+    business_group = recode_business_group(business_group),
+    selected_variance_sum = round(selected_variance_sum, 4),
+    max_selected_cumulative_ratio = round(max_selected_cumulative_ratio, 4),
+    first_pc_variance_ratio = round(first_pc_variance_ratio, 4)
+  ) %>%
+  rename(
+    "分组" = group,
+    "业务组别" = business_group,
+    "选取主成分数" = selected_pc_n,
+    "所选组内方差贡献率合计" = selected_variance_sum,
+    "所选组内累计贡献率" = max_selected_cumulative_ratio,
+    "组内第一主成分贡献率" = first_pc_variance_ratio
+  )
+write_csv_out(pca_business_summary, "06_PCA业务组主成分汇总.csv")
+
+# 7. BP模型MSE
 bp_mse <- read_csv_in("bp_mse_comparison.csv") %>%
   mutate(
     group = recode_group(group),
@@ -174,9 +231,9 @@ bp_mse <- read_csv_in("bp_mse_comparison.csv") %>%
     "训练集MSE" = train_mse,
     "测试集MSE" = test_mse
   )
-write_csv_out(bp_mse, "06_BP神经网络MSE对比.csv")
+write_csv_out(bp_mse, "07_BP神经网络MSE对比.csv")
 
-# 7. 新样本预测
+# 8. 新样本预测
 new_pred <- read_csv_in("new_sample_predictions.csv") %>%
   mutate(
     sample_name = recode(
@@ -195,18 +252,33 @@ new_pred <- read_csv_in("new_sample_predictions.csv") %>%
     "预测模型" = prediction_model,
     "预测MovieLens评分" = predicted_movielens_rating
   )
-write_csv_out(new_pred, "07_新样本预测结果.csv")
+write_csv_out(new_pred, "08_新样本预测结果.csv")
 
-# 8. 指标字典
+# 9. 指标字典
 feature_dict <- read_csv_in("feature_dictionary.csv") %>%
   mutate(
     feature = recode_feature(feature),
+    business_group = recode_business_group(business_group),
     source_type = recode(source_type, !!!source_type_map, .default = source_type)
   ) %>%
-  rename("指标名称" = feature, "指标来源类型" = source_type, "指标说明" = definition)
-write_csv_out(feature_dict, "08_指标来源说明.csv")
+  rename(
+    "指标名称" = feature,
+    "业务组别" = business_group,
+    "指标来源类型" = source_type,
+    "指标说明" = definition
+  )
+write_csv_out(feature_dict, "09_指标来源说明.csv")
 
-# 9. MovieLens来源摘要
+# 10. 建模业务分组
+business_features <- read_csv_in("business_feature_groups.csv") %>%
+  mutate(
+    business_group = recode_business_group(business_group),
+    feature = recode_feature(feature)
+  ) %>%
+  rename("业务组别" = business_group, "建模变量" = feature)
+write_csv_out(business_features, "10_业务分组变量清单.csv")
+
+# 11. MovieLens来源摘要
 source_summary <- read_csv_in("movielens_source_summary.csv") %>%
   mutate(
     dataset_source = recode(
@@ -217,31 +289,34 @@ source_summary <- read_csv_in("movielens_source_summary.csv") %>%
     )
   ) %>%
   rename("数据来源" = dataset_source, "TMDB融合前电影行数" = movie_rows_before_tmdb_merge)
-write_csv_out(source_summary, "09_MovieLens数据来源摘要.csv")
+write_csv_out(source_summary, "11_MovieLens数据来源摘要.csv")
 
-# 10. 中文主成分表达式
+# 12. 中文主成分表达式
 expr_lines <- readr::read_lines(file.path(input_dir, "pca_component_expressions.txt"))
 for (nm in names(group_map)) {
   expr_lines <- str_replace_all(expr_lines, fixed(nm), group_map[[nm]])
 }
+for (nm in names(business_group_map)) {
+  expr_lines <- str_replace_all(expr_lines, fixed(nm), business_group_map[[nm]])
+}
 for (nm in names(feature_map)[order(nchar(names(feature_map)), decreasing = TRUE)]) {
   expr_lines <- str_replace_all(expr_lines, fixed(nm), feature_map[[nm]])
 }
-readr::write_lines(expr_lines, file.path(output_dir, "10_PCA主成分表达式.txt"))
+readr::write_lines(expr_lines, file.path(output_dir, "12_PCA主成分表达式.txt"))
 
-# 11. 中文汇总说明
+# 13. 中文汇总说明
 summary_lines <- c(
   "电影评价预测项目中文结果汇总",
   "",
   "1. 样本处理结果：融合后得到4631部电影，经过缺失值填补和3σ异常值剔除后保留4204部电影。",
   "2. 双重分层结果：1990年及以前640部，1991-2009年2810部，2010年及以后754部；各年代内部按用户活跃度近似三等分。",
-  "3. PCA结果：全局样本保留8个主成分，累计贡献率88.99%；1990年及以前保留7个主成分，累计贡献率85.55%；1991-2009年保留7个主成分，累计贡献率85.11%；2010年及以后保留8个主成分，累计贡献率88.77%。",
-  "4. BP神经网络结果：全局测试集MSE为0.3485；1990年及以前测试集MSE为0.2703；1991-2009年测试集MSE为0.3007；2010年及以后测试集MSE为0.4720。",
+  "3. PCA结果：采用业务分组约束，原始变量先划分为流量热度、商业运营、内容属性、受众偏好四组，各组内部单独提取主成分后再输入BP神经网络。",
+  "4. 建模约束说明：流量热度组独立形成traffic_PC类主成分，影片年龄仅位于内容属性组，避免仅由上映年份或影片年龄单一变量主导预测。",
   "5. 指标口径说明：TMDB popularity为TMDB原生流量热度指标；用户活跃度、影片总互动量和评分用户数均为MovieLens评分交互衍生指标。"
 )
 readr::write_lines(summary_lines, file.path(output_dir, "00_中文结果汇总说明.txt"))
 
-# 12. 重新生成中文图片，而不是只复制英文图片
+# 14. 重新生成中文图片，而不是只复制英文图片
 if (.Platform$OS.type == "windows") {
   grDevices::windowsFonts(
     SimSun = grDevices::windowsFont("SimSun"),
@@ -254,16 +329,16 @@ if (.Platform$OS.type == "windows") {
 
 plot_feature_map <- c(
   tmdb_popularity_log = "TMDB热度",
+  tmdb_vote_count_log = "TMDB评分数",
+  ml_interaction_count_log = "影片互动量",
+  ml_user_count_log = "评分用户数",
   tmdb_budget_log = "预算",
   tmdb_revenue_log = "票房",
   tmdb_profit_log = "利润",
   tmdb_roi_clean = "投资回报率",
   tmdb_runtime = "片长",
-  tmdb_vote_count_log = "TMDB评分数",
-  movie_age = "影片年龄",
   tmdb_genre_count = "类型数",
-  ml_interaction_count_log = "影片互动量",
-  ml_user_count_log = "评分用户数",
+  movie_age = "影片年龄",
   ml_user_activity_mean_log = "用户活跃度",
   ml_high_activity_user_share = "高活跃占比",
   ml_rating_sd = "评分波动"
@@ -280,7 +355,7 @@ colnames(corr_matrix) <- unname(plot_feature_map[colnames(corr_matrix)])
 rownames(corr_matrix) <- unname(plot_feature_map[rownames(corr_matrix)])
 
 png(
-  filename = file.path(output_dir, "11_相关性热力图.png"),
+  filename = file.path(output_dir, "13_相关性热力图.png"),
   width = 1800,
   height = 1500,
   res = 160,
@@ -304,37 +379,34 @@ make_scree_plot <- function(group_code, title_cn, output_name) {
   plot_df <- read_csv_in("pca_variance_all_groups.csv") %>%
     filter(group == group_code) %>%
     mutate(
+      business_group_cn = recode_business_group(business_group),
       component_index = row_number(),
-      component_label = component,
+      component_label = local_component,
       selected_label = if_else(selected_for_bp, "用于BP建模", "未选入BP")
     )
 
-  p <- ggplot(plot_df, aes(x = component_index)) +
+  p <- ggplot(plot_df, aes(x = local_component)) +
     geom_col(
       aes(y = variance_ratio, fill = "单个主成分方差贡献率"),
       width = 0.72,
       alpha = 0.9
     ) +
     geom_line(
-      aes(y = cumulative_ratio, color = "累计方差贡献率"),
+      aes(y = cumulative_ratio, color = "组内累计方差贡献率", group = business_group_cn),
       linewidth = 1,
-      group = 1
     ) +
     geom_point(
-      aes(y = cumulative_ratio, color = "累计方差贡献率"),
+      aes(y = cumulative_ratio, color = "组内累计方差贡献率"),
       size = 2
     ) +
-    scale_x_continuous(
-      breaks = plot_df$component_index,
-      labels = plot_df$component_label
-    ) +
+    facet_wrap(~ business_group_cn, scales = "free_x") +
     scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
     scale_fill_manual(values = c("单个主成分方差贡献率" = "#2F6F73")) +
-    scale_color_manual(values = c("累计方差贡献率" = "#C4492D")) +
+    scale_color_manual(values = c("组内累计方差贡献率" = "#C4492D")) +
     labs(
-      title = paste0(title_cn, "PCA碎石图"),
-      x = "主成分",
-      y = "方差贡献率 / 累计贡献率",
+      title = paste0(title_cn, "业务分组约束PCA碎石图"),
+      x = "组内主成分",
+      y = "组内方差贡献率 / 累计贡献率",
       fill = "",
       color = ""
     ) +
@@ -348,15 +420,16 @@ make_scree_plot <- function(group_code, title_cn, output_name) {
   ggsave(
     filename = file.path(output_dir, output_name),
     plot = p,
-    width = 8.5,
-    height = 5.2,
+    width = 10,
+    height = 6,
     dpi = 160
   )
 }
 
-make_scree_plot("global", "全局样本", "12_全局样本PCA碎石图.png")
-make_scree_plot("year_le_1990", "1990年及以前", "13_1990年及以前PCA碎石图.png")
-make_scree_plot("year_1991_2009", "1991-2009年", "14_1991-2009年PCA碎石图.png")
-make_scree_plot("year_ge_2010", "2010年及以后", "15_2010年及以后PCA碎石图.png")
+make_scree_plot("global", "全局样本", "14_全局样本业务分组PCA碎石图.png")
+make_scree_plot("year_le_1990", "1990年及以前", "15_1990年及以前业务分组PCA碎石图.png")
+make_scree_plot("year_1991_2009", "1991-2009年", "16_1991-2009年业务分组PCA碎石图.png")
+make_scree_plot("year_ge_2010", "2010年及以后", "17_2010年及以后业务分组PCA碎石图.png")
 
 message("中文结果已输出到：", normalizePath(output_dir, winslash = "/"))
+

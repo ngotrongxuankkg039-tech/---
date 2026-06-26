@@ -2,8 +2,10 @@ ml-1m/
 downloads/
 TMDB/
 Kaggle IMDB/
+outputs_movie_pca_bp/
 
 *.zip
+*.docx
 .RData
 .Rhistory
 ~$*.docx
