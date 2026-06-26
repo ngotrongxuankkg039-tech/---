@@ -1,0 +1,9 @@
+ml-1m/
+downloads/
+TMDB/
+Kaggle IMDB/
+
+*.zip
+.RData
+.Rhistory
+~$*.docx
